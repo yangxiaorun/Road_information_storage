@@ -1,0 +1,32 @@
+def quickSort(nums):  # 这种写法的平均空间复杂度为 O(nlogn)
+    if len(nums) <= 1:
+        return nums
+    pivot = nums[0]  # 基准值
+    left = [nums[i] for i in range(1, len(nums)) if nums[i] < pivot] 
+    right = [nums[i] for i in range(1, len(nums)) if nums[i] >= pivot]
+    return quickSort(left) + [pivot] + quickSort(right)
+
+'''
+@param nums: 待排序数组
+@param left: 数组上界
+@param right: 数组下界
+'''
+def quickSort2(nums, left, right):  # 这种写法的平均空间复杂度为 O(logn) 
+    # 分区操作
+    def partition(nums, left, right):
+        pivot = nums[left]  # 基准值
+        while left < right:
+            while left < right and nums[right] >= pivot:
+                right -= 1
+            nums[left] = nums[right]  # 比基准小的交换到前面
+            while left < right and nums[left] <= pivot:
+                left += 1
+            nums[right] = nums[left]  # 比基准大交换到后面
+        nums[left] = pivot # 基准值的正确位置，也可以为 nums[right] = pivot
+        return left  # 返回基准值的索引，也可以为 return right
+    # 递归操作
+    if left < right:
+        pivotIndex = partition(nums, left, right)
+        quickSort2(nums, left, pivotIndex - 1)  # 左序列
+        quickSort2(nums, pivotIndex + 1, right) # 右序列
+    return nums
