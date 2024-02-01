@@ -1,6 +1,7 @@
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union, Callable
 import torch
 from torch.library import Library
+from torch._decomp import register_decomposition
 import torch.distributed.distributed_c10d as c10d
 from torchair.ge_concrete_graph.ge_graph import Tensor, DataType
 from torchair.ge_concrete_graph import ge_apis as ge
@@ -13,13 +14,47 @@ op_all_to_all_single = npu_define_lib.define(
     "all_to_all_single(Tensor input, SymInt[]? output_split_sizes, \
      SymInt[]? input_split_sizes, str tag, int[] ranks, int group_size) -> Tensor")
 
-op_all_to_all_single_npu = npu_define_lib.define(
-    "all_to_all_single_npu(Tensor input, SymInt[] output_split_sizes, \
+op_all_to_all_single_npu_affine = npu_define_lib.define(
+    "all_to_all_single_npu_affine(Tensor input, SymInt[] output_split_sizes, \
      SymInt[] input_split_sizes, SymInt[] send_counts, SymInt[] send_displacements, SymInt[] recv_counts,\
      SymInt[] recv_displacements, str tag, int[] ranks, int group_size) -> Tensor")
 
-op_all_to_all = npu_define_lib.define(
-    "all_to_all(Tensor[] input, str tag, int[] ranks, int group_size) -> Tensor[]")
+
+@register_decomposition(torch.ops.npu_define.all_to_all_single)
+def all_to_all_single_decomposition(
+    input: torch.Tensor,
+    output_split_sizes: Optional[List[int]],
+    input_split_sizes: Optional[List[int]],
+    tag: str,
+    ranks: List[int],
+    group_size: int,
+):
+    if input_split_sizes is None and output_split_sizes is None:
+        input_split_sizes = []
+        output_split_sizes = []
+        spilt_size = input.numel() // group_size
+        for i in range(group_size):
+            input_split_sizes.append(spilt_size)
+            output_split_sizes.append(spilt_size)
+
+    send_counts = []
+    recv_counts = []
+    send_displacements = [0]
+    recv_displacements = [0]
+    assert len(input_split_sizes) == len(output_split_sizes)
+    for i in range(len(input_split_sizes)):
+        send_counts.append(input_split_sizes[i])
+        if i > 0:
+            send_displacements.append(send_displacements[i - 1] + send_counts[i - 1])
+
+    for i in range(len(output_split_sizes)):
+        recv_counts.append(output_split_sizes[i])
+        if i > 0:
+            recv_displacements.append(recv_displacements[i - 1] + recv_counts[i - 1])
+
+    return torch.ops.npu_define.all_to_all_single_npu_affine(input, output_split_sizes, input_split_sizes,
+        send_counts, send_displacements, recv_counts, recv_displacements, tag, ranks, group_size)
+
 
 def npu_all_to_all_single(
         input: torch.Tensor,
@@ -46,6 +81,7 @@ def npu_all_to_all_single(
     )
     return out_tensor
 
+
 def npu_all_to_all_single_meta(
         input,
         output_split_sizes,
@@ -57,44 +93,18 @@ def npu_all_to_all_single_meta(
     if output_split_sizes is None:
         return input.new_empty(input.size())
     else:
-        #TODO check 非负 2.3有接口，2.1暂未实现
+        # TO DO check 非负,且不能影响符号化 2.3有接口，2.1暂未实现 后期对接官方算子 临时方案先不实现
         out_size = list(input.size())
         out_size[0] = sum(output_split_sizes)
         return input.new_empty(out_size)
 
-def npu_all_to_all(
-        input_tensor_list: List[torch.Tensor],
-        tag: str,
-        ranks: List[int],
-        group_size: int,
-):
-    pg = c10d._find_or_create_pg_by_ranks_and_tag(tag, ranks, group_size)
-
-    output_tensor_list = []
-    for input_tensor in input_tensor_list:
-        output_tensor_list.append(input_tensor.new_empty(input_tensor.size()))
-
-    work = c10d.all_to_all(output_tensor_list, input_tensor_list, group=pg, async_op=False)
-
-    return output_tensor_list
-
-def npu_all_to_all_meta(
-        input_tensor_list: List[torch.Tensor],
-        tag: str,
-        ranks: List[int],
-        group_size: int,
-):
-    meta_output_list = []
-    for input_tensor in input_tensor_list:
-        meta_output_list.append(torch.empty_like(input_tensor))
-    return meta_output_list
 
 npu_define_lib.impl(op_all_to_all_single, npu_all_to_all_single, 'CPU')
 npu_define_lib.impl(op_all_to_all_single, npu_all_to_all_single, 'PrivateUse1')
 npu_define_lib.impl(op_all_to_all_single, npu_all_to_all_single_meta, 'Meta')
 
 
-def npu_all_to_all_single_npu_meta(
+def npu_all_to_all_single_npu_affine_meta(
     input: Tensor,
     output_split_sizes: List[int],
     input_split_sizes: List[int],
@@ -110,16 +120,12 @@ def npu_all_to_all_single_npu_meta(
     out_size[0] = sum(output_split_sizes)
     return input.new_empty(out_size)
 
-# npu_define_lib.impl(op_all_to_all_single_npu, npu_all_to_all_single, 'CPU')
-# npu_define_lib.impl(op_all_to_all_single_npu, npu_all_to_all_single, 'PrivateUse1')
-npu_define_lib.impl(op_all_to_all_single_npu, npu_all_to_all_single_npu_meta, 'Meta')
 
-npu_define_lib.impl(op_all_to_all, npu_all_to_all, 'CPU')
-npu_define_lib.impl(op_all_to_all, npu_all_to_all, 'PrivateUse1')
-npu_define_lib.impl(op_all_to_all, npu_all_to_all_meta, 'Meta')
+npu_define_lib.impl(op_all_to_all_single_npu_affine, npu_all_to_all_single_npu_affine_meta, 'Meta')
 
-@register_fx_node_ge_converter(torch.ops.npu_define.all_to_all_single_npu.default)
-def convert_all_to_all_single_npu(
+
+@register_fx_node_ge_converter(torch.ops.npu_define.all_to_all_single_npu_affine.default)
+def convert_all_to_all_single_npu_affine(
     input: Tensor,
     output_split_sizes,
     input_split_sizes,
@@ -150,92 +156,6 @@ def convert_all_to_all_single_npu(
     return y
 
 
-# @register_fx_node_ge_converter(torch.ops.npu_define.all_to_all_single.default)
-# def convert_all_to_all_single(
-#     input: Tensor,
-#     output_split_sizes: Any,
-#     input_split_sizes: Any,
-#     tag: str,
-#     ranklist: List,
-#     group_size: int,
-#     *,
-#     out: Tensor = None,
-#     meta_outputs: Any = None,
-# ):
-#     split_sizes_tensorized = False
-#     send_counts=[]
-#     send_displacements=[0]
-#     recv_counts=[]
-#     recv_displacements=[0]
-#     # TO DO:为了高性能等分场景使用hcomalltoall(约有10%的收益，待hccl补充hcomalltoall lowering)
-#     if input_split_sizes is None and output_split_sizes is None:
-#         # 用户未使用split_sizes， 需要给ge api手动构造输入
-#         split_sizes_tensorized = True
-#         input_split_sizes = []
-#         output_split_sizes = []
-#         dims_0_tensor = ge.Gather(ge.Shape(input), ge.Cast(0, dst_type=DataType.DT_INT64))
-#         dims_0_tensor = ge.Cast(dims_0_tensor, dst_type=DataType.DT_INT64)
-#         spilt_size = ge.Div(dims_0_tensor, ge.Cast(group_size, dst_type=DataType.DT_INT64))
-#         for i in range(group_size):
-#             input_split_sizes.append(spilt_size)
-#             output_split_sizes.append(spilt_size)
-#         send_displacements[0] = ge.Cast(0, dst_type=DataType.DT_INT64)
-#         recv_displacements[0] = ge.Cast(0, dst_type=DataType.DT_INT64)
-
-#     # 用户主动传split_sizes时， 动态时 output_split_sizes会被pack成tensor 此时需要取其中元素 做偏移计算
-#     if isinstance(input_split_sizes, Tensor) or isinstance(output_split_sizes, Tensor):
-#         split_sizes_tensorized = True
-#         if isinstance(input_split_sizes, List):
-#             input_split_sizes = dtype_promote(input_split_sizes, target_dtype=DataType.DT_INT64)
-#         if isinstance(output_split_sizes, List):
-#             output_split_sizes = dtype_promote(output_split_sizes, target_dtype=DataType.DT_INT64)
-#         # GG 此处input_split_sizes pack后没有shape 会出错
-#         input_split_sizes = ge.SplitV(input_split_sizes, ge.Cast(1, dst_type=DataType.DT_INT64), ge.Cast(0, dst_type=DataType.DT_INT32), num_split=group_size)
-#         output_split_sizes = ge.SplitV(output_split_sizes, ge.Cast(1, dst_type=DataType.DT_INT64), ge.Cast(0, dst_type=DataType.DT_INT32), num_split=group_size)
-
-#     assert len(input_split_sizes) == len(output_split_sizes)
-#     input_size = len(input_split_sizes)
-#     for i in range(input_size):
-#         send_counts.append(input_split_sizes[i])
-#         if i > 0:
-#             if split_sizes_tensorized:
-#                 send_displacements.append(ge.Add(send_displacements[i - 1], send_counts[i - 1]))
-#             else:
-#                 send_displacements.append(send_displacements[i - 1] + send_counts[i - 1])
-    
-#     output_size = len(output_split_sizes)
-#     for i in range(output_size):
-#         recv_counts.append(output_split_sizes[i])
-#         if i > 0:
-#             if split_sizes_tensorized:
-#                 recv_displacements.append(ge.Add(recv_displacements[i - 1], recv_counts[i - 1]))
-#             else:
-#                 recv_displacements.append(recv_displacements[i - 1] + recv_counts[i - 1])
-
-#     if split_sizes_tensorized:
-#         send_counts = ge.ConcatV2(send_counts, concat_dim=0, N=len(send_counts))
-#         send_displacements = ge.ConcatV2(send_displacements, concat_dim=0, N=len(send_displacements))
-#         recv_counts = ge.ConcatV2(recv_counts, concat_dim=0, N=len(recv_counts))
-#         recv_displacements = ge.ConcatV2(recv_displacements, concat_dim=0, N=len(recv_displacements))
-#     else:
-#         send_counts, send_displacements, recv_counts, recv_displacements = dtype_promote(send_counts,
-#             send_displacements, recv_counts, recv_displacements, target_dtype=DataType.DT_INT64)
-
-#     rank = torch.distributed.get_rank()
-#     pg = c10d._find_or_create_pg_by_ranks_and_tag(tag, ranklist, group_size)
-#     device = torch.distributed.distributed_c10d._get_pg_default_device(pg)
-#     if device.type == "cpu":
-#         y = ge.HcomAllToAllV(send_data=input, send_counts=send_counts, send_displacements=send_displacements,
-#                              recv_counts=recv_counts, recv_displacements=recv_displacements, group=tag)
-#     elif device.type == "npu":
-#         hcom_name = pg._get_backend(device).get_hccl_comm_name(rank)
-#         y = ge.HcomAllToAllV(send_data=input, send_counts=send_counts, send_displacements=send_displacements,
-#                              recv_counts=recv_counts, recv_displacements=recv_displacements, group=hcom_name)
-#     else:
-#         raise ValueError("The initialized aggregate communication backend is not a CPU or NPU.")
-#     y._node.attr["ranklist"].list.i.extend(ranklist)
-#     return y
-
 def npu_all_to_all_single_patch_dist(
         output,
         input,
@@ -244,7 +164,10 @@ def npu_all_to_all_single_patch_dist(
         group=None,
         async_op=False,
 ):
-    # TODO: split_size的check, 待确认check不能断图
+    c10d._check_single_tensor(output, "output")
+    c10d._check_single_tensor(input, "input")
+    c10d._ensure_all_tensors_same_dtype(output, input)
+
     if group is None:
         group = c10d._world.default_pg
     ranklist = torch.distributed.get_process_group_ranks(group)
@@ -253,44 +176,47 @@ def npu_all_to_all_single_patch_dist(
                                                      tag, ranklist, len(ranklist))
     output.copy_(npu_out)
 
-def npu_all_to_all_patch_dist(
-        output_tensor_list: List[torch.Tensor],
+
+torch.distributed.all_to_all_single = npu_all_to_all_single_patch_dist
+
+
+op_all_to_all = npu_define_lib.define(
+    "all_to_all(Tensor[] input, str tag, int[] ranks, int group_size) -> Tensor[]")
+
+
+def npu_all_to_all(
         input_tensor_list: List[torch.Tensor],
-        group=None,
-        async_op=False,
+        tag: str,
+        ranks: List[int],
+        group_size: int,
 ):
-    if group is None:
-        group = c10d._world.default_pg
-    ranklist = torch.distributed.get_process_group_ranks(group)
-    tag = c10d._get_group_tag(group)
-    # TODO 校验所有input\output tensor在同一个device上？output_tensor_list和input_tensor_list len相同？
-    npu_out_list = torch.ops.npu_define.all_to_all(input_tensor_list, tag, ranklist, len(ranklist))
-    if len(npu_out_list) != len(output_tensor_list):
-        raise ValueError(f'The expect npu_out_list len {len(output_tensor_list)}, but got {len(npu_out_list)}.')
-    
-    for i in range(len(output_tensor_list)):
-        output_tensor_list[i].copy_(npu_out_list[i])
+    pg = c10d._find_or_create_pg_by_ranks_and_tag(tag, ranks, group_size)
+
+    output_tensor_list = []
+    for input_tensor in input_tensor_list:
+        output_tensor_list.append(input_tensor.new_empty(input_tensor.size()))
+
+    work = c10d.all_to_all(output_tensor_list, input_tensor_list, group=pg, async_op=False)
+
+    return output_tensor_list
 
 
-@register_fx_node_ge_converter(torch.ops.aten.sym_numel)
-def convert_aten_sym__numel(
-    self,
-    *,
-    out: Tensor = None,
-    meta_outputs: Any = None,
+def npu_all_to_all_meta(
+        input_tensor_list: List[torch.Tensor],
+        tag: str,
+        ranks: List[int],
+        group_size: int,
 ):
-# ge.ReduceProdD(ge.Shape(input_tensor_list[i]), axes=[0])
-    return ge.Cast(ge.ReduceProdD(ge.Shape(self), axes=[0]), dst_type=DataType.DT_INT64)
+    meta_output_list = []
+    for input_tensor in input_tensor_list:
+        meta_output_list.append(torch.empty_like(input_tensor))
+    return meta_output_list
 
-# import math
-# @register_fx_node_ge_converter(math.floor)
-# def conveter_operator_floordiv(
-#     self,
-#     meta_outputs,
-# ):
-#     return ge.Cast(ge.Floor(self), dst_type=DataType.DT_INT64)
 
-# all2all方案未定，当前只实现最基础的功能，可以考虑不上库
+npu_define_lib.impl(op_all_to_all, npu_all_to_all, 'PrivateUse1')
+npu_define_lib.impl(op_all_to_all, npu_all_to_all_meta, 'Meta')
+
+
 @register_fx_node_ge_converter(torch.ops.npu_define.all_to_all.default)
 def convert_all_to_all(
     input_tensor_list: List[torch.Tensor],
@@ -305,7 +231,7 @@ def convert_all_to_all(
     send_displacements=[0]
     recv_counts=[]
     recv_displacements=[0]
-    # TO DO:为了高性能使用hcomalltoall IR
+
     input_shape_list = []
     output_split_sizes = []
     input_split_sizes = []
@@ -317,14 +243,12 @@ def convert_all_to_all(
     send_displacements[0] = ge.Cast(0, dst_type=DataType.DT_INT64)
     recv_displacements[0] = ge.Cast(0, dst_type=DataType.DT_INT64)
 
-    input_size = len(input_split_sizes)
-    for i in range(input_size):
+    for i in range(len(input_split_sizes)):
         send_counts.append(input_split_sizes[i])
         if i > 0:
             send_displacements.append(ge.Add(send_displacements[i - 1], send_counts[i - 1]))
     
-    output_size = len(output_split_sizes)
-    for i in range(output_size):
+    for i in range(len(output_split_sizes)):
         recv_counts.append(output_split_sizes[i])
         if i > 0:
             recv_displacements.append(ge.Add(recv_displacements[i - 1], recv_counts[i - 1]))
@@ -360,5 +284,28 @@ def convert_all_to_all(
     return output_results
 
 
-torch.distributed.all_to_all_single = npu_all_to_all_single_patch_dist
+def npu_all_to_all_patch_dist(
+        output_tensor_list: List[torch.Tensor],
+        input_tensor_list: List[torch.Tensor],
+        group=None,
+        async_op=False,
+):
+    assert len(input_tensor_list) == len(output_tensor_list)
+    if group is None:
+        group = c10d._world.default_pg
+    ranklist = torch.distributed.get_process_group_ranks(group)
+    tag = c10d._get_group_tag(group)
+    c10d._check_tensor_list(output_tensor_list, "output_tensor_list")
+    c10d._check_tensor_list(input_tensor_list, "input_tensor_list")
+    c10d._ensure_all_tensors_same_dtype(output_tensor_list, input_tensor_list)
+
+    npu_out_list = torch.ops.npu_define.all_to_all(input_tensor_list, tag, ranklist, len(ranklist))
+    if len(npu_out_list) != len(output_tensor_list):
+        raise ValueError(f'The expect npu_out_list len {len(output_tensor_list)}, but got {len(npu_out_list)}.')
+    
+    for i in range(len(output_tensor_list)):
+        output_tensor_list[i].copy_(npu_out_list[i])
+
+
 torch.distributed.all_to_all = npu_all_to_all_patch_dist
+
