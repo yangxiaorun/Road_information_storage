@@ -1,0 +1,228 @@
+diff --git a/torchair/concrete_graph/session.cpp b/torchair/concrete_graph/session.cpp
+index e6d2f2f..040548b 100644
+--- a/torchair/concrete_graph/session.cpp
++++ b/torchair/concrete_graph/session.cpp
+@@ -156,9 +156,21 @@ Status Session::SetGraphConstMemoryBase(uint32_t id, const void *const memory, s
+   return Status::Success();
+ }
+ 
++Status Session::SetGraphFixedFeatureMemoryBase(uint32_t id, const void *const memory, size_t size) {
++  TNG_RETURN_IF_ERROR(EnsureInitialized());
++  TNG_ASSERT_GE_OK(global_ge_session->SetGraphFixedFeatureMemoryBase(id, memory, size));
++  return Status::Success();
++}
++
+ Status Session::UpdateGraphFeatureMemoryBase(uint32_t id, const void *const memory, size_t size) {
+   TNG_RETURN_IF_ERROR(EnsureInitialized());
+   TNG_ASSERT_GE_OK(global_ge_session->UpdateGraphFeatureMemoryBase(id, memory, size));
+   return Status::Success();
+ }
++
++Status Session::UpdateGraphRefreshableFeatureMemoryBase(uint32_t id, const void *const memory, size_t size) {
++  TNG_RETURN_IF_ERROR(EnsureInitialized());
++  TNG_ASSERT_GE_OK(global_ge_session->UpdateGraphRefreshableFeatureMemoryBase(id, memory, size));
++  return Status::Success();
++}
+ }  // namespace tng
+\ No newline at end of file
+diff --git a/torchair/include/session.h b/torchair/include/session.h
+index ddaeb11..7a18472 100644
+--- a/torchair/include/session.h
++++ b/torchair/include/session.h
+@@ -39,8 +39,12 @@ class Session {
+ 
+   Status SetGraphConstMemoryBase(uint32_t id, const void *const memory, size_t size);
+ 
++  Status SetGraphFixedFeatureMemoryBase(uint32_t id, const void *const memory, size_t size);
++
+   Status UpdateGraphFeatureMemoryBase(uint32_t id, const void *const memory, size_t size);
+ 
++  Status UpdateGraphRefreshableFeatureMemoryBase(uint32_t id, const void *const memory, size_t size);
++
+  private:
+   Session() : initialized_(false), status_(Status::Success()){};
+   std::mutex mu_;
+diff --git a/torchair/npu_graph_executor/dynamic_npu_graph_executor.cpp b/torchair/npu_graph_executor/dynamic_npu_graph_executor.cpp
+index f166ea1..894fdea 100644
+--- a/torchair/npu_graph_executor/dynamic_npu_graph_executor.cpp
++++ b/torchair/npu_graph_executor/dynamic_npu_graph_executor.cpp
+@@ -85,6 +85,11 @@ Status DynamicNpuGraphExecutor::Run(const std::vector<at::Tensor> &torch_inputs,
+   // Register allocator for GE before run, according to stream.
+   AllocatorManager::GetInstance().EnsureAllocatorRegistered(stream);
+ 
++  if (fixed_mem_addr_ == nullptr) {
++      TNG_LOG(INFO) << "yxr DynamicNpuGraphExecutor set  fixed_mem_addr_";
++      TNG_RETURN_IF_ERROR(AllocAndSetFixedMemory(stream, graph_data_, fixed_mem_addr_));
++  }
++
+   TNG_ASSERT(assigned_outputs.empty() || (assigned_outputs.size() == graph_data_->output_dtypes.size()));
+   std::vector<ge::Tensor> ge_outputs;
+   ge_outputs.resize(graph_data_->output_dtypes.size());
+diff --git a/torchair/npu_graph_executor/dynamic_npu_graph_executor.h b/torchair/npu_graph_executor/dynamic_npu_graph_executor.h
+index 2c170d2..adc6949 100644
+--- a/torchair/npu_graph_executor/dynamic_npu_graph_executor.h
++++ b/torchair/npu_graph_executor/dynamic_npu_graph_executor.h
+@@ -4,6 +4,7 @@
+ #include "executor.h"
+ #include "graph_data.h"
+ #include "graph/tensor.h"
++#include "memory/Allocator.h"
+ 
+ namespace tng {
+ class DynamicNpuGraphExecutor : public Executor {
+@@ -16,7 +17,7 @@ class DynamicNpuGraphExecutor : public Executor {
+ 
+  private:
+   Status AssembleInputs(const std::vector<at::Tensor> &inputs, std::vector<at::Tensor> &retain_tmp_device_inputs);
+-
++  std::unique_ptr<ge::MemBlock, DelMemBlockFunc> fixed_mem_addr_{nullptr};
+   std::vector<ge::Tensor> inputs_holder_;
+   std::shared_ptr<GraphData> graph_data_;
+ };
+diff --git a/torchair/npu_graph_executor/npu_utils.cpp b/torchair/npu_graph_executor/npu_utils.cpp
+index 7a828f9..14c7e5d 100644
+--- a/torchair/npu_graph_executor/npu_utils.cpp
++++ b/torchair/npu_graph_executor/npu_utils.cpp
+@@ -11,6 +11,7 @@
+ #include "external/graph/types.h"
+ #include "graph/utils/type_utils.h"
+ #include "graph/utils/tensor_adapter.h"
++#include "AllocatorManager.h"
+ 
+ namespace tng {
+ 
+@@ -91,4 +92,28 @@ Status AtNpuTensorToGeTensor(const at::Tensor &tensor, ge::Tensor &ge_tensor) {
+   return Status::Success();
+ }
+ 
++Status AllocAndSetFixedMemory(void *stream, std::shared_ptr<GraphData> &graph_data,
++                              std::unique_ptr<ge::MemBlock, DelMemBlockFunc> &fixed_mem_addr) {
++  // Register allocator for GE before run, according to stream.
++  auto allocator = AllocatorManager::GetInstance().EnsureAllocatorRegistered(stream);
++  TNG_ASSERT_NOTNULL(allocator);
++  TNG_ASSERT_NOTNULL(graph_data->summary);
++  size_t fixed_mem_size = 0U;
++  TNG_ASSERT_GE_OK(graph_data->summary->GetFixedFeatureMemorySize(fixed_mem_size));
++  TNG_LOG(DEBUG) << "yxr AllocAndSetFixedMemory get fixed_mem_size : " << fixed_mem_size;
++  ge::MemBlock *block = allocator->Malloc(fixed_mem_size);
++  TNG_ASSERT_NOTNULL(block);
++  fixed_mem_addr.reset(block);
++  static auto kFree = [](ge::MemBlock *p) {
++    if (p != nullptr) {
++      p->Free();
++      p = nullptr;
++    }
++  };
++  fixed_mem_addr.get_deleter() = kFree;
++  TNG_RETURN_IF_ERROR(Session::GetInstance().SetGraphFixedFeatureMemoryBase(graph_data->id, fixed_mem_addr->GetAddr(),
++                                                                            fixed_mem_addr->GetSize()));
++  return Status::Success();
++}
++
+ }  // namespace tng
+diff --git a/torchair/npu_graph_executor/npu_utils.h b/torchair/npu_graph_executor/npu_utils.h
+index 4524e80..88aaa03 100644
+--- a/torchair/npu_graph_executor/npu_utils.h
++++ b/torchair/npu_graph_executor/npu_utils.h
+@@ -4,6 +4,8 @@
+ #include "tng_status.h"
+ #include "torch/torch.h"
+ #include "graph/tensor.h"
++#include "graph_data.h"
++#include "memory/Allocator.h"
+ 
+ namespace tng {
+ Status GetCurrentStream(void **stream);
+@@ -14,6 +16,9 @@ Status AssembleDataAndStorageShapeToGe(const at::Tensor &tensor, ge::Tensor &ge_
+ 
+ Status AtNpuTensorToGeTensor(const at::Tensor &tensor, ge::Tensor &ge_tensor);
+ 
++Status AllocAndSetFixedMemory(void *stream, std::shared_ptr<GraphData> &graph_data,
++                              std::unique_ptr<ge::MemBlock, DelMemBlockFunc> &fixed_mem_addr);
++
+ }  // namespace tng
+ 
+ #endif  // TORCH_AIR_TORCH_AIR_NPU_GRAPH_EXECUTOR_NPU_UTILS_H_
+\ No newline at end of file
+diff --git a/torchair/npu_graph_executor/static_npu_graph_executor.cpp b/torchair/npu_graph_executor/static_npu_graph_executor.cpp
+index 473629a..738ade7 100644
+--- a/torchair/npu_graph_executor/static_npu_graph_executor.cpp
++++ b/torchair/npu_graph_executor/static_npu_graph_executor.cpp
+@@ -164,6 +164,41 @@ Status StaticNpuGraphExecutor::AllocAndUpdateFeatureMemory(void *stream) {
+   return Status::Success();
+ }
+ 
++Status StaticNpuGraphExecutor::AllocAndUpdateFeatureMemoryAndFixedMomory(void *stream) {
++  TNG_RETURN_IF_ERROR(AllocAndSetFixedMemory(stream, graph_data_, fixed_mem_addr_));
++
++  size_t fm_size = 0U;
++  TNG_ASSERT_GE_OK(graph_data_->summary->GetRefreshableFeatureMemorySize(fm_size));
++  // Register allocator for GE before run, according to stream.
++  auto allocator = AllocatorManager::GetInstance().EnsureAllocatorRegistered(stream);
++  TNG_ASSERT_NOTNULL(allocator);
++  TNG_LOG(INFO) << "Try to alloc and update feature map memory, graph id = " << graph_data_->id
++                << " , size = " << fm_size;
++  bool is_fm_refreshable = false;
++  TNG_ASSERT_GE_OK(graph_data_->summary->GetFeatureMemoryBaseRefreshable(is_fm_refreshable));
++  if (!is_fm_refreshable) {
++    if (feature_map_block_ == nullptr) {  // first run with fm is unable to refresh
++      feature_map_block_ = std::dynamic_pointer_cast<NpuAllocator>(allocator)->MallocFeatureMemory(fm_size, nullptr);
++      TNG_ASSERT_NOTNULL(feature_map_block_);
++      TNG_ASSERT(Session::GetInstance()
++                     .UpdateGraphRefreshableFeatureMemoryBase(graph_data_->id, feature_map_block_->GetAddr(),
++                                                   feature_map_block_->GetSize()).IsSuccess());
++    } else {
++      TNG_LOG(INFO) << "No need to refresh feature map addr, use addr = " << feature_map_block_->GetAddr()
++                    << " , size = " << feature_map_block_->GetSize();
++    }
++  } else {
++    feature_map_block_ = std::dynamic_pointer_cast<NpuAllocator>(allocator)->Malloc(fm_size);
++    TNG_ASSERT_NOTNULL(feature_map_block_);
++    TNG_ASSERT(Session::GetInstance()
++            .UpdateGraphRefreshableFeatureMemoryBase(graph_data_->id, feature_map_block_->GetAddr(), feature_map_block_->GetSize())
++            .IsSuccess());
++  }
++  TNG_LOG(INFO) << "UpdateGraphRefreshableFeatureMemoryBase success, feature map addr = " << feature_map_block_->GetAddr()
++                << " , size = " << feature_map_block_->GetSize();
++  return Status::Success();
++}
++
+ Status StaticNpuGraphExecutor::Run(const std::vector<at::Tensor> &torch_inputs,
+                                    const std::vector<c10::optional<at::Tensor>> &torch_outputs,
+                                    std::vector<at::Tensor> &outputs, void *stream) {
+@@ -185,8 +220,16 @@ Status StaticNpuGraphExecutor::Run(const std::vector<at::Tensor> &torch_inputs,
+   if (const_mem_addr_ == nullptr) {
+     TNG_RETURN_IF_ERROR(AllocAndSetConstMemory(stream));
+   }
+-  // Alloc and update feature memory
+-  TNG_RETURN_IF_ERROR(AllocAndUpdateFeatureMemory(stream));
++  bool use_fix_memory = true;
++  if (use_fix_memory) {
++    TNG_LOG(INFO) << "yxr StaticNpuGraphExecutor set  fixed_mem_addr_";
++    TNG_RETURN_IF_ERROR(AllocAndUpdateFeatureMemoryAndFixedMomory(stream));
++  } else {
++    // Alloc and update feature memory
++    TNG_LOG(INFO) << "yxr StaticNpuGraphExecutor no use use_fix_memory";
++    TNG_RETURN_IF_ERROR(AllocAndUpdateFeatureMemory(stream));
++  }
++
+   {
+     RECORD_FUNCTION("RunGraphWithStreamAsync", std::vector<c10::IValue>({}));
+     TNG_RETURN_IF_ERROR(Session::GetInstance().RunGraph(graph_data_->id, inputs_holder_, outputs_holder_, stream));
+diff --git a/torchair/npu_graph_executor/static_npu_graph_executor.h b/torchair/npu_graph_executor/static_npu_graph_executor.h
+index 8b614a3..864caba 100644
+--- a/torchair/npu_graph_executor/static_npu_graph_executor.h
++++ b/torchair/npu_graph_executor/static_npu_graph_executor.h
+@@ -26,9 +26,12 @@ class StaticNpuGraphExecutor : public Executor {
+ 
+   Status AllocAndUpdateFeatureMemory(void *stream);
+ 
++  Status AllocAndUpdateFeatureMemoryAndFixedMomory(void *stream);
++
+   std::vector<ge::Tensor> inputs_holder_;
+   std::vector<ge::Tensor> outputs_holder_;
+   std::shared_ptr<GraphData> graph_data_;
++  std::unique_ptr<ge::MemBlock, DelMemBlockFunc> fixed_mem_addr_{nullptr};
+   std::unique_ptr<ge::MemBlock, DelMemBlockFunc> const_mem_addr_{nullptr};
+   ge::MemBlock *feature_map_block_{nullptr};
+ 
